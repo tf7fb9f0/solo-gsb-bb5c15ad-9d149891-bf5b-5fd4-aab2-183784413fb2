@@ -1,7 +1,9 @@
 """SQLite persistence. The database file lives under DATA_DIR (container volume)."""
 from __future__ import annotations
 
+import json
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Iterator, Mapping, Sequence
@@ -53,7 +55,22 @@ CREATE TABLE IF NOT EXISTS batch_rules (
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_batch_rules_session ON batch_rules(session_id, position);
+CREATE TABLE IF NOT EXISTS merge_previews (
+    -- 合并预览的会话专属待合并快照；确认只凭不可猜测的一次性标识换取。
+    -- 不与 sessions 建外键：预览本身不创建会话，会话不存在时也允许生成快照。
+    token TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    records_json TEXT NOT NULL,
+    basis_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    consumed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_merge_previews_session ON merge_previews(session_id);
 """
+
+# 预览快照保留期：24 小时内未确认的待合并快照视为过期。
+MERGE_PREVIEW_TTL_HOURS = 24
 
 
 class NotFoundError(LookupError):
@@ -244,7 +261,93 @@ def reset_decisions(conn: sqlite3.Connection, session_id: str) -> int:
 
 def delete_session(conn: sqlite3.Connection, session_id: str) -> bool:
     cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    # merge_previews 不挂外键（预览不创建会话），显式随会话清理。
+    conn.execute("DELETE FROM merge_previews WHERE session_id = ?", (session_id,))
     return cur.rowcount > 0
+
+
+# ---------- Merge preview snapshots (preview/confirm binding) ----------
+
+def save_merge_preview(
+    conn: sqlite3.Connection,
+    session_id: str,
+    scope: str,
+    records: Sequence[Mapping[str, Any]],
+    basis: Sequence[Mapping[str, Any]],
+) -> str:
+    """保存一次合并预览的待合并快照，返回不可猜测的一次性标识。
+
+    同一会话只保留最新一份快照：再次预览使旧标识立即失效，避免堆积与
+    「凭旧预览确认」。顺手清掉超过保留期的过期快照。token 由 256 位
+    随机数生成（secrets），不可由会话内容或顺序猜测。
+    """
+    conn.execute(
+        "DELETE FROM merge_previews WHERE session_id = ?", (session_id,)
+    )
+    conn.execute(
+        "DELETE FROM merge_previews WHERE created_at < datetime('now', ?)",
+        (f"-{MERGE_PREVIEW_TTL_HOURS} hours",),
+    )
+    token = secrets.token_hex(32)
+    conn.execute(
+        "INSERT INTO merge_previews(token, session_id, scope, records_json, basis_json) "
+        "VALUES(?, ?, ?, ?, ?)",
+        (
+            token,
+            session_id,
+            scope,
+            json.dumps(list(records), ensure_ascii=False),
+            json.dumps(list(basis), ensure_ascii=False),
+        ),
+    )
+    return token
+
+
+def consume_merge_preview(
+    conn: sqlite3.Connection, token: str, session_id: str
+) -> dict[str, Any] | None:
+    """原子消耗一次合并预览标识并返回其快照。
+
+    用条件 UPDATE 一次性完成「校验未使用 + 标记已用」（同时立即抢下写锁，
+    使随后的基线核对与写入在同一写事务内原子完成）。返回值：
+
+    - ``{"status": "ok", ...}``：消耗成功，附带预览时保存的快照；
+    - ``{"status": "used"}``：标识存在但已被使用（或刚被并发确认抢走）；
+    - ``None``：标识不存在、不属于该会话或已过期。
+
+    快照含 scope / records / basis，均为预览时服务端自行保存的数据，
+    确认请求不再接受任何客户端回传的记录或基线。
+    """
+    row = conn.execute(
+        "SELECT session_id, consumed_at, created_at FROM merge_previews WHERE token = ?",
+        (token,),
+    ).fetchone()
+    if row is None or row["session_id"] != session_id:
+        return None
+    stale = conn.execute(
+        "SELECT 1 FROM merge_previews WHERE token = ? "
+        "AND created_at < datetime('now', ?)",
+        (token, f"-{MERGE_PREVIEW_TTL_HOURS} hours"),
+    ).fetchone()
+    if stale is not None:
+        return None
+    cur = conn.execute(
+        "UPDATE merge_previews SET consumed_at = datetime('now') "
+        "WHERE token = ? AND consumed_at IS NULL",
+        (token,),
+    )
+    if cur.rowcount == 0:
+        return {"status": "used"}
+    saved = conn.execute(
+        "SELECT scope, records_json, basis_json FROM merge_previews WHERE token = ?",
+        (token,),
+    ).fetchone()
+    return {
+        "status": "ok",
+        "scope": saved["scope"],
+        "records": json.loads(saved["records_json"]),
+        "basis": json.loads(saved["basis_json"]),
+    }
 
 
 def session_has_data(conn: sqlite3.Connection, session_id: str) -> bool:

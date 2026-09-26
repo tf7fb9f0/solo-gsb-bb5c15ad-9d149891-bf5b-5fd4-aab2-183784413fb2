@@ -115,7 +115,7 @@ class TestJudgeOffsetsAPI(unittest.TestCase):
         self.assertEqual(p["counts"]["added"], 4)
         r = client.post(
             f"/api/sessions/{SID}/merge/confirm",
-            json={"records": p["records"], "basis": p["basis"], "scope": "judge"},
+            json={"token": p["token"]},
         )
         self.assertEqual(r.status_code, 200, r.text)
         jo = r.json()["judge_offsets"]

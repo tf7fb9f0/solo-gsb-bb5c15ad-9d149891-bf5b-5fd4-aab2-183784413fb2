@@ -2369,6 +2369,8 @@ function renderMergePreview() {
         确认后将改动 <b>${p.will_modify}</b> 条，并清除变更/删除记录上的旧裁决
         <b class="delta-down">${p.decisions_cleared}</b> 条；
         <b>未变记录及其裁决、已保存的批处理规则保持不动</b>。
+        <br>确认只凭本次预览的一次性标识进行；请直接点下方按钮确认，
+        预览过期、已确认或会话数据变化后需<b>重新选择合并文件预览</b>。
       </div>
       <div class="merge-filters">${chips}</div>
       <div class="table-wrap">
@@ -2442,11 +2444,10 @@ async function confirmMerge() {
   ) return;
   setMergeMsg("正在同一事务中应用合并…");
   try {
-    const scope = document.querySelector('input[name="scope"]:checked').value;
     analysis = await api(`/api/sessions/${SESSION_ID}/merge/confirm`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: p.records, basis: p.basis, scope }),
+      body: JSON.stringify({ token: p.token }),
     });
     const applied = analysis.merge_applied.counts;
     const cleared = analysis.merge_applied.decisions_cleared;

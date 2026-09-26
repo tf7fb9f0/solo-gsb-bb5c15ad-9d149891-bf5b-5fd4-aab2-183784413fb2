@@ -8,8 +8,11 @@
 - ``changed``   两边都有但分数不同    → 原地更新分数，旧裁决自动清除
 - ``removed``   仅存在于当前会话      → 删除记录，其旧裁决一并清除
 
-差异计算是纯函数，预览不触碰数据库；确认时由
-``database.merge_scores`` 在单个事务内落库。
+差异计算是纯函数，预览不触碰业务数据；预览时服务端会把解析出的新记录与
+当前基线快照（``current_basis``）存入 ``merge_previews`` 表并返回一个
+不可猜测的一次性标识，确认时只凭该标识在单个事务内取回服务端快照，
+由 ``database.merge_scores`` 落库——确认请求不接受任何客户端回传的
+记录或基线，因此无法把「未预览的 99」塞进确认请求。
 
 预览基线（``current_basis``）除评分快照外，还为「分数变更/将删除」
 两类受影响评分记录裁决状态（是否存在、采用原分、理由）；确认时由
@@ -39,10 +42,6 @@ _STATUS_ORDER = {s: i for i, s in enumerate(STATUSES)}
 DECISION_CLEAR = "clear"   # 变更/删除：旧裁决（如有）将被清除
 DECISION_KEEP = "keep"     # 未变：现有裁决保持不动
 DECISION_NONE = "none"     # 该记录当前没有裁决
-
-
-class MergeValidationError(ValueError):
-    """合并提交的 JSON 记录不合法（返回 400）。"""
 
 
 def _triple(row: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -188,7 +187,7 @@ def current_basis(
 
 
 def valid_basis_shape(raw: Any) -> bool:
-    """校验客户端回传的基线快照格式（含受影响行的裁决快照字段）。"""
+    """校验快照基线格式（快照由服务端自行存取，仅用于异常数据兜底）。"""
     if not isinstance(raw, list):
         return False
     for item in raw:
@@ -264,51 +263,3 @@ def basis_matches(
             ):
                 return False
     return True
-
-
-def normalize_incoming_records(raw: Any) -> list[dict[str, Any]]:
-    """校验确认请求里回传的新记录（与 parse_scores 同样严格）。"""
-    if not isinstance(raw, list):
-        raise MergeValidationError("records 必须是数组。")
-    records: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for i, row in enumerate(raw, start=1):
-        where = f"第 {i} 条记录"
-        if not isinstance(row, Mapping):
-            raise MergeValidationError(f"{where}必须是对象。")
-
-        def text(field: str, label: str) -> str:
-            value = row.get(field)
-            if not isinstance(value, str) or not value.strip():
-                raise MergeValidationError(f"{where}的「{label}」不能为空。")
-            return value.strip()
-
-        contestant = text("contestant", "选手")
-        judge = text("judge", "评委")
-        item = text("item", "项目")
-        score_raw = row.get("score")
-        if isinstance(score_raw, bool) or not isinstance(score_raw, (int, float, str)):
-            raise MergeValidationError(f"{where}的分数必须是数字。")
-        score_text = str(score_raw).strip()
-        if not score_text:
-            raise MergeValidationError(f"{where}的「分数」不能为空。")
-        try:
-            score = float(score_text)
-        except ValueError:
-            raise MergeValidationError(f"{where}的分数「{score_text}」不是数字。")
-        if score != score or score in (float("inf"), float("-inf")):
-            raise MergeValidationError(f"{where}的分数无效。")
-
-        triple = (contestant, judge, item)
-        if triple in seen:
-            raise MergeValidationError(
-                f"{where}存在重复评分（选手={contestant}，评委={judge}，项目={item}）。"
-            )
-        seen.add(triple)
-        records.append(
-            {"contestant": contestant, "judge": judge, "item": item, "score": score}
-        )
-
-    if not records:
-        raise MergeValidationError("合并导入至少需要一条评分记录。")
-    return records

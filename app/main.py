@@ -19,11 +19,9 @@ from .merge import (
     STATUS_CHANGED,
     STATUS_LABELS as MERGE_STATUS_LABELS,
     STATUS_REMOVED,
-    MergeValidationError,
     basis_matches,
     build_merge_plan,
     current_basis,
-    normalize_incoming_records,
     valid_basis_shape,
 )
 from .pending_rank import PendingRankValidationError, pending_rank_bounds
@@ -145,12 +143,9 @@ class RuleSetBody(BaseModel):
 
 
 class MergeConfirmBody(BaseModel):
-    # 客户端原样回传预览时解析出的记录与基线快照；
-    # 服务端重新校验并核对基线，避免「过期预览」覆盖新数据。
-    records: list[dict[str, Any]] = Field(min_length=1)
-    basis: list[dict[str, Any]] = Field(min_length=0)
-    # 仅在会话尚不存在（向空会话合并）时用于创建会话；已有会话保持原校准范围。
-    scope: Literal["judge", "judge_item"] | None = None
+    # 确认只携带预览返回的一次性标识；待合并记录与基线均由服务端在
+    # 预览时保存，客户端无法回传或篡改（否则无法确认未预览的内容）。
+    token: str = Field(min_length=1, max_length=128)
 
 
 def _normalize_session_rules(body: RuleSetBody, analysis: dict[str, Any]) -> list[dict[str, Any]]:
@@ -255,7 +250,10 @@ async def merge_preview(
     """合并导入的只读预览：解析上传文件并与当前会话数据逐条比对。
 
     按「选手+评委+项目」识别 新增/未变/分数变更/仅存在于当前会话 四类记录，
-    逐行给出新旧分数与受影响的旧裁决。不落库、不创建会话、不改变任何裁决。
+    逐行给出新旧分数与受影响的旧裁决。不改评分、裁决或规则，也不创建会话；
+    仅把本次预览的待合并记录与基线快照（含受影响评分的裁决状态）保存为
+    **会话专属**快照，并返回一个不可猜测的一次性标识 ``token``，确认时
+    只认该标识。同一会话再次预览会使旧标识立即失效。
     """
     raw = await file.read()
     try:
@@ -283,6 +281,11 @@ async def merge_preview(
             for row in plan["rows"]
             if row["status"] in (STATUS_CHANGED, STATUS_REMOVED)
         }
+        basis = current_basis(current, decision_snapshots)
+        # 服务端保存待合并快照并发放一次性标识；响应不回传 records/basis。
+        token = db.save_merge_preview(
+            conn, session_id, effective_scope, records, basis
+        )
     return {
         "scope": effective_scope,
         "scope_label": SCOPE_LABELS[effective_scope],
@@ -294,28 +297,48 @@ async def merge_preview(
         "total_incoming": plan["total_incoming"],
         "will_modify": plan["will_modify"],
         "decisions_cleared": plan["decisions_cleared"],
-        "records": records,
-        "basis": current_basis(current, decision_snapshots),
+        "token": token,
     }
 
 
 @app.post("/api/sessions/{session_id}/merge/confirm")
 def merge_confirm(session_id: str, body: MergeConfirmBody) -> dict[str, Any]:
-    """确认合并：在同一个数据库事务中落库预览结果。
+    """确认合并：凭预览标识在同一个数据库事务中落库预览结果。
 
-    分数变更/删除记录的旧裁决在事务内自动清除；未变记录及其裁决、已保存的
-    批处理规则均不触碰。确认时在同一事务内先核对预览基线：除全部评分外，
-    还包括受影响评分（分数变更/将删除）的裁决状态（存在性、采用原分、
-    理由）；预览后这些数据被其他操作改动（含新增/修改/删除相关裁决）时
-    返回 409 要求重新预览，且不写入任何合并结果。
+    待合并记录与预览基线在预览时已由服务端保存，确认请求只携带不可猜测的
+    一次性标识，无法塞入未预览的数据。事务内顺序为：
+
+    1. 原子消耗标识（条件 UPDATE，同时取得写锁）：标识无效/不属于该会话/
+       已过期 → 409「标识无效，请重新预览」；已使用（含并发的第二次确认）
+       → 409「该预览已用于确认，请重新预览」；
+    2. 按标识读取服务端保存的原始待合并记录，重建合并计划，核对当前全部
+       评分及受影响评分（分数变更/将删除）的裁决状态（存在性、采用原分、
+       理由）是否仍与预览基线一致；任何变化 → 409 且整体回滚，不写入
+       评分或裁决；
+    3. 核对通过后才在同一事务内应用差异；未变记录及其裁决、已保存的批处理
+       规则均不触碰。任一步失败随事务整体回滚（标识保持未消耗，可凭原预览
+       重试；只有应用成功提交时标识才真正被消耗）。
     """
-    try:
-        records = normalize_incoming_records(body.records)
-    except MergeValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    if not valid_basis_shape(body.basis):
-        raise HTTPException(status_code=400, detail="basis 基线快照格式不正确，请重新预览。")
     with db.get_conn() as conn:
+        snapshot = db.consume_merge_preview(conn, body.token.strip(), session_id)
+        if snapshot is None:
+            raise HTTPException(
+                status_code=409,
+                detail="合并预览标识无效或已过期，请重新预览后再确认合并。",
+            )
+        if snapshot["status"] == "used":
+            raise HTTPException(
+                status_code=409,
+                detail="该合并预览已用于确认；如需再次合并请重新预览。",
+            )
+        records = snapshot["records"]
+        saved_basis = snapshot["basis"]
+        if not valid_basis_shape(saved_basis):
+            # 快照为服务端写入，正常不会发生；兜底按过期预览处理。
+            raise HTTPException(
+                status_code=409,
+                detail="合并预览基线快照不可用，请重新预览后再确认合并。",
+            )
         current = db.load_scores(conn, session_id)
         decisions = db.load_decisions(conn, session_id)
         stored_scope = db.get_scope(conn, session_id)
@@ -326,14 +349,14 @@ def merge_confirm(session_id: str, body: MergeConfirmBody) -> dict[str, Any]:
             if row["status"] in (STATUS_CHANGED, STATUS_REMOVED)
         }
         # 核对先于一切写入，且与写入处于同一事务；不匹配则整体放弃。
-        if not basis_matches(body.basis, current, decisions, affected_ids):
+        if not basis_matches(saved_basis, current, decisions, affected_ids):
             raise HTTPException(
                 status_code=409,
                 detail="预览后当前会话数据已变化，请重新预览后再确认合并。",
             )
         if stored_scope is None:
-            db.ensure_session(conn, session_id, body.scope or SCOPE_JUDGE)
-        # 全部变更随本事务一起提交；任何失败整体回滚。
+            db.ensure_session(conn, session_id, snapshot["scope"])
+        # 全部变更随本事务一起提交；任何失败整体回滚（标识一并回到未消耗）。
         result = db.merge_scores(conn, session_id, plan["rows"])
         scope = _resolve_scope(conn, session_id, None)
         analysis = _build_analysis(conn, session_id, scope)
