@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多评委评分校准</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>多评委评分校准</h1>
+  <div class="session-info">
+    <span>会话：<code id="session-id"></code></span>
+    <button id="btn-clear" class="btn btn-ghost" title="清空当前会话的全部数据与裁决">清空会话</button>
+  </div>
+</header>
+
+<main>
+  <!-- 1. 数据导入 -->
+  <section class="card" id="panel-import">
+    <h2>① 数据导入</h2>
+    <p class="hint">
+      CSV 需包含四列：<b>选手</b>、<b>评委</b>、<b>项目</b>、<b>分数</b>（中英文表头均可，如 contestant/judge/item/score）。
+      同一「选手 × 评委 × 项目」仅允许一条分数。
+    </p>
+    <div class="toolbar">
+      <label class="btn btn-primary">
+        上传 CSV（替换导入）
+        <input type="file" id="file-input" accept=".csv,text/csv" hidden>
+      </label>
+      <label class="btn">
+        合并导入（预览差异）
+        <input type="file" id="merge-file-input" accept=".csv,text/csv" hidden>
+      </label>
+      <button id="btn-sample" class="btn">载入示例数据</button>
+      <div class="scope-switch">
+        校准范围：
+        <label><input type="radio" name="scope" value="judge" checked> 按评委（跨项目汇总）</label>
+        <label><input type="radio" name="scope" value="judge_item"> 按评委×项目</label>
+      </div>
+      <span id="import-msg" class="msg"></span>
+    </div>
+    <p class="hint" style="margin-bottom:0;">
+      「上传 CSV」为<b>替换导入</b>：整体替换当前会话的全部评分，并清空旧裁决与批处理规则；
+      「合并导入」会先按「选手 + 评委 + 项目」逐条比对，预览<b>新增、未变、分数变更、仅存在于当前会话</b>四类记录
+      （含新旧分数与将受影响的裁决），确认后才在同一事务落库；取消不改任何数据。
+    </p>
+    <div id="merge-preview"></div>
+  </section>
+
+  <!-- 空状态 -->
+  <section id="empty-state" class="card empty">
+    <p>📄 暂无数据。请上传 CSV 或点击「载入示例数据」开始。</p>
+  </section>
+
+  <div id="dashboard" hidden>
+    <!-- 2. 校准参数与反转 -->
+    <section class="card">
+      <h2>② 稳健标准化与名次反转</h2>
+      <div id="reference-info" class="formula"></div>
+      <div id="stats-row" class="stats"></div>
+      <h3 class="sub">校准分组参数</h3>
+      <div id="group-table-wrap" class="table-wrap"></div>
+      <h3 class="sub">名次反转 <span id="reversal-count" class="badge"></span></h3>
+      <div id="reversal-panel"></div>
+    </section>
+
+    <!-- 3. 排名总表 -->
+    <section class="card">
+      <h2>③ 选手排名（实时）</h2>
+      <div class="toolbar">
+        <button id="btn-reset-decisions" class="btn btn-ghost">全部恢复采用校准分</button>
+        <button id="btn-export" class="btn btn-primary">导出审计 CSV</button>
+      </div>
+      <div id="rank-table-wrap" class="table-wrap"></div>
+
+      <div class="promo-wrap">
+        <h3 class="sub">晋级门槛检查（只读，实时重算）</h3>
+        <p class="hint">
+          为一个或多个项目填写<b>最终项目均分最低线</b>，并可选填写<b>最终总分线</b>，
+          系统基于当前<b>校准范围</b>与<b>逐项裁决</b>实时判定每位选手是否达标：
+          所有门槛项目均分达标（且总分达标）为<b class="promo-pass">达标</b>；任一均分或总分不达标为<b class="promo-fail">未达标</b>并列出差距；
+          <b class="promo-ins">缺少任一被设门槛项目</b>的选手标为<b class="promo-ins">数据不足</b>并列出缺失项目，<b>不按 0 分处理</b>。
+          门槛仅保存在本页面，结果<b>只读不落库</b>；评分、裁决或校准范围变化后自动失效并重算，也可一键清空。
+        </p>
+        <div class="toolbar promo-controls">
+          <button id="btn-promo-run" class="btn btn-primary">检查晋级门槛</button>
+          <label class="promo-total-label">最终总分线（可选）
+            <input type="number" id="promo-total" class="select" step="any" placeholder="不检查总分">
+          </label>
+          <button id="btn-promo-clear" class="btn btn-ghost-card">清空门槛</button>
+          <span id="promo-msg" class="msg"></span>
+        </div>
+        <div id="promo-inputs" class="promo-inputs"></div>
+        <div id="promo-result" class="promo-result"></div>
+      </div>
+
+      <div class="pending-wrap">
+        <h3 class="sub">待补评分名次边界（只读，实时重算）</h3>
+        <p class="hint">
+          选择一个<b>项目</b>、<b>目标评委人数</b>与<b>待补评分的最终分上下限</b>：沿用当前<b>校准范围</b>与<b>逐项裁决</b>形成的已有最终分，
+          将每位选手在该项目的评分<b>补足至目标人数</b>（每条待补分可独立取闭区间内任意值），重算该项目均分区间与最终总分区间（<b>其余项目保持现值</b>），
+          并分别用「本人总分上限 vs 他人下限」「本人下限 vs 他人上限」求<b>可达到的最好 / 最差竞赛名次</b>（同分容差与主排名一致）。
+          若任一选手在该项目的已有评分数超过目标人数，请求将被拒绝。
+          结果<b>只读不落库</b>；评分、裁决或校准范围变化后自动失效并重算。
+        </p>
+        <div class="toolbar pending-controls">
+          <label>项目
+            <select id="pending-item" class="select"></select>
+          </label>
+          <label>目标评委人数
+            <input type="number" id="pending-target" class="select" min="1" max="1000000" step="1" value="3">
+          </label>
+          <label>待补分下限
+            <input type="number" id="pending-min" class="select" step="any" value="0">
+          </label>
+          <label>待补分上限
+            <input type="number" id="pending-max" class="select" step="any" value="10">
+          </label>
+          <button id="btn-pending-run" class="btn btn-primary">计算名次边界</button>
+          <button id="btn-pending-clear" class="btn btn-ghost-card" disabled>清除结果</button>
+          <span id="pending-msg" class="msg"></span>
+        </div>
+        <div id="pending-result" class="pending-result"></div>
+      </div>
+    </section>
+
+    <!-- 4. 双选手对比 -->
+    <section class="card">
+      <h2>④ 双选手对比</h2>
+      <p class="hint">
+        从当前数据中选择两名选手，对比<b>原始、校准与最终总分差</b>（A−B）及最终名次，并按项目列出双方得分与差值。
+        逐项目按<b>最终分</b>汇总领先与持平（同时附按原始分、校准分的统计）；某选手在某项目无评分时标为<b>「无数据」</b>，
+        不按零分参与差值或胜负统计。对比由当前评分实时计算，随校准范围或人工裁决变化自动刷新，<b>不另存评分</b>。
+      </p>
+      <div class="toolbar compare-controls">
+        <label>选手 A <select id="compare-a" class="select"></select></label>
+        <span class="compare-vs">VS</span>
+        <label>选手 B <select id="compare-b" class="select"></select></label>
+        <span id="compare-msg" class="msg"></span>
+      </div>
+      <div id="compare-result" class="compare-result"></div>
+    </section>
+
+    <!-- 5. 评委排序分歧 -->
+    <section class="card">
+      <h2>⑤ 评委排序分歧</h2>
+      <p class="hint">
+        按<b>项目 × 评委对</b>分组，仅取两位评委<b>都打过分</b>的选手（共评选手），枚举全部选手对并依<b>原始分</b>归类：
+        <b>同向</b>（双方均非同分、排序方向一致）、<b>逆向</b>（双方均非同分、排序方向相反）、
+        <b>单方同分</b>（恰有一位评委给两名选手同分）、<b>双方同分</b>（两位评委都给同分）。
+        共评选手少于 2 名的分组标为<b>「样本不足」</b>，不给出分歧率；
+        仅<b>双方均非同分</b>（同向、逆向）的选手对计入可比较对数与逆向占比。
+        本面板<b>只读、仅基于原始分</b>，不受校准范围与逐项裁决影响，导入或合并数据后实时刷新；
+        点分组行可展开查看其中<b>逆向选手对的双方原分</b>。
+      </p>
+      <div id="disagreement-panel" class="disagreement-panel"></div>
+    </section>
+
+    <!-- 6. 评委严宽差异诊断 -->
+    <section class="card">
+      <h2>⑥ 评委严宽差异诊断（只读，仅原始分）</h2>
+      <p class="hint">
+        仅用<b>原始分</b>：对每对评委，取两人<b>共同评过的「选手 × 项目」</b>记录（共评记录），
+        计算原始分差（评委甲 − 评委乙）的<b>中位数</b>作为观测分差，并以<b>共评记录数</b>为权重，
+        在评委关系图上<b>逐连通分量</b>做加权最小二乘拟合——各分量内评委偏移量的<b>均值为零</b>
+        （偏移量只是分量内相对值，<b>不跨分量比较</b>）；没有任何共评边的评委标为<b>「不可估计」</b>。
+        下表列出各评委偏移量与共评覆盖量，以及每对评委的观测分差、拟合分差与残差。
+        本面板<b>只读</b>，不受校准范围与逐项裁决影响，导入或合并数据后实时刷新。
+      </p>
+      <div id="offsets-panel" class="offsets-panel"></div>
+    </section>
+
+    <!-- 7. 评分裁决规则批处理 -->
+    <section class="card">
+      <h2>⑦ 评分裁决规则批处理</h2>
+      <p class="hint">
+        按<b>评委、项目、原始分区间、校准分区间</b>组合条件（留空表示不限），批量指定「保留原分 / 采用校准分」与理由模板，
+        并为每条规则指定<b>优先级</b>（数字越小越优先，数字相同按规则顺序前者优先）。
+        先点「预览」查看每条规则的命中数、未命中数、多规则冲突及按优先级裁决后的唯一结果；预览只读，不会保存或改动裁决。
+        确认后点「应用」，系统将在<b>一个事务</b>中保存规则并批量写入裁决，随后自动刷新排名。
+        理由模板支持占位符：<code>{judge}</code> 评委、<code>{item}</code> 项目、<code>{raw}</code> 原始分、<code>{calibrated}</code> 校准分。
+      </p>
+      <div id="rules-editor"></div>
+      <div class="toolbar" style="margin-top:12px;">
+        <button id="btn-rule-add" class="btn">＋ 新增规则</button>
+        <button id="btn-rule-preview" class="btn btn-primary">预览命中与冲突（不保存）</button>
+        <button id="btn-rule-save" class="btn">仅保存规则</button>
+        <button id="btn-rule-apply" class="btn btn-primary">应用：保存规则并批量写入裁决</button>
+        <button id="btn-rule-clear" class="btn btn-ghost-card">清空全部规则</button>
+        <span id="rules-msg" class="msg"></span>
+      </div>
+      <div id="rules-preview" class="rules-preview"></div>
+    </section>
+
+    <!-- 8. 排名稳定性实验 -->
+    <section class="card">
+      <h2>⑧ 排名稳定性实验（临时模拟，不保存）</h2>
+      <p class="hint">
+        选择<b>临时排除一名评委或一个项目</b>，系统按当前校准范围重算原始分、校准分、最终总分与竞赛名次，
+        并逐位展示每位选手相对基线的名次/总分变化及被移除的评分条数。
+        实验结果仅保留在当前页面，<b>不会写入裁决或数据库</b>；上传、切换范围或修改裁决会自动清除实验结果，也可手动恢复基线。
+      </p>
+      <div class="toolbar stability-controls">
+        <select id="stability-type" class="select">
+          <option value="judge">排除评委</option>
+          <option value="item">排除项目</option>
+        </select>
+        <select id="stability-name" class="select"></select>
+        <button id="btn-stability-run" class="btn btn-primary">运行实验</button>
+        <button id="btn-stability-clear" class="btn btn-ghost" disabled>清除结果，恢复基线</button>
+        <span id="stability-msg" class="msg"></span>
+      </div>
+      <div id="stability-result" class="stability-result"></div>
+    </section>
+
+    <!-- 9. 补评分派 -->
+    <section class="card">
+      <h2>⑨ 补评分派（只读预览）</h2>
+      <p class="hint">
+        以当前会话中<b>已有评分</b>的「选手 × 项目」组合为<b>需求单元</b>，统一设定每个单元的<b>目标评委人数</b>，
+        并分别设定<b>各评委本轮可接任务数</b>。只有<b>已给该项目打过分（任意选手）、但尚未给该单元打分</b>的评委才能接该单元；
+        扣除已有评分后，在评委容量与每单元缺口约束下，求<b>分派任务总数最大</b>的方案，
+        并按固定的「评委 → 项目 → 选手」顺序稳定输出并列结果。
+        本面板<b>只读：不写入评分或裁决</b>，仅预览任务分派与各单元未满足数量。
+      </p>
+      <div class="toolbar backfill-controls">
+        <label class="bf-target">每单元目标评委人数
+          <input type="number" id="backfill-target" class="select" min="1" max="1000000" step="1" value="3">
+        </label>
+        <button id="btn-backfill-run" class="btn btn-primary">生成分派预览</button>
+        <button id="btn-backfill-clear" class="btn btn-ghost-card" disabled>清除预览</button>
+        <span id="backfill-msg" class="msg"></span>
+      </div>
+      <div id="backfill-caps" class="bf-caps"></div>
+      <div id="backfill-result" class="backfill-result"></div>
+    </section>
+
+    <!-- 10. 逐项裁决 -->
+    <section class="card">
+      <h2>⑩ 逐项评分裁决</h2>
+      <p class="hint">对每条原始评分选择「采用校准分」或「保留原分」并填写理由，排名将实时重算。</p>
+      <div id="detail-panel"></div>
+    </section>
+
+    <!-- 11. 项目权重临界点分析 -->
+    <section class="card">
+      <h2>⑪ 项目权重临界点分析（只读）</h2>
+      <p class="hint">
+        在当前<b>校准范围</b>与<b>逐项裁决</b>形成的<b>项目最终均分</b>基础上，选择一个项目与倍率上限（1～5），
+        令该项目倍率从 <b>0</b> 连续变化到上限、其余项目倍率恒为 <b>1</b>，枚举区间内<b>所有选手总分相等的临界倍率</b>
+        （同位置交点自动合并；<b>始终并列的选手不产生交点</b>），并展示每个临界点及相邻开区间中点处的<b>竞赛名次与总分</b>，
+        标出交点处并列的选手。选手缺失该项目时该项目<b>按 0 贡献</b>（斜率为 0）。
+        结果<b>只读、实时计算</b>：评分、裁决或校准范围变化后需重新计算，不写入任何数据。
+      </p>
+      <div class="toolbar weight-controls">
+        <label>项目
+          <select id="weight-item" class="select"></select>
+        </label>
+        <label>倍率上限
+          <input type="number" id="weight-upper" class="select" min="1" max="5" step="0.5" value="3">
+        </label>
+        <button id="btn-weight-run" class="btn btn-primary">计算临界点</button>
+        <span id="weight-msg" class="msg"></span>
+      </div>
+      <div id="weight-result" class="weight-result"></div>
+    </section>
+
+    <!-- 12. 同评委可比对照 -->
+    <section class="card">
+      <h2>⑫ 同评委可比对照（只读，实时重算）</h2>
+      <p class="hint">
+        在当前<b>最终分</b>上，对每一对选手<b>逐项目只取双方共同评分的评委</b>：分别求<b>同一评委集合</b>上的最终分均分，
+        再把各可比项目的差值汇总为<b>可比总分差（A−B）</b>并给出<b>可比领先者</b>。
+        某项目<b>一方缺评分</b>或双方在该项目<b>没有共同评委</b>时，该项目列为<b>不可比、不按零分</b>；全部项目都不可比的选手对整对标为<b>不可比</b>。
+        面板同时给出基于现有<b>全量最终总分</b>的方向并与可比方向对照，<b class="cj-reversed">反向</b>的选手对（两种口径方向相反）会醒目标出并置顶；
+        点开任一行可查看逐项目的共同评委覆盖、同评委均分与计算明细。
+        结果<b>只读不落库</b>：评分、裁决或校准范围变化后自动重算，不写入任何评分或裁决。
+      </p>
+      <div class="toolbar">
+        <span id="cj-msg" class="msg"></span>
+      </div>
+      <div id="cj-panel" class="cj-panel"></div>
+    </section>
+  </div>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

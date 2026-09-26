@@ -1,0 +1,13 @@
+services:
+  calibration:
+    build: .
+    image: judge-calibration:latest
+    container_name: judge-calibration
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - calibration-data:/data
+    restart: unless-stopped
+
+volumes:
+  calibration-data:
