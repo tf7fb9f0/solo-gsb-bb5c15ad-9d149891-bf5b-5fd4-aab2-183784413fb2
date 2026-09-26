@@ -13,12 +13,9 @@ from app.merge import (
     STATUS_CHANGED,
     STATUS_REMOVED,
     STATUS_UNCHANGED,
-    MergeValidationError,
     basis_matches,
     build_merge_plan,
     current_basis,
-    normalize_incoming_records,
-    valid_basis_shape,
 )
 
 
@@ -269,97 +266,6 @@ class TestBasisDecisionSnapshots(unittest.TestCase):
         self.assertTrue(basis_matches(self.basis, self.current))
         self.assertTrue(basis_matches(self.basis, self.current, self.decisions))
         self.assertTrue(basis_matches(self.basis, self.current, None, self.affected))
-
-
-class TestValidBasisShape(unittest.TestCase):
-    def test_accepts_score_only_and_snapshot_entries(self):
-        self.assertTrue(valid_basis_shape([]))
-        self.assertTrue(
-            valid_basis_shape(
-                [
-                    {"contestant": "A", "judge": "J", "item": "P", "score": 5.0},
-                    {
-                        "contestant": "B",
-                        "judge": "J",
-                        "item": "P",
-                        "score": 6,
-                        "decision": {"use_raw": True, "reason": "r"},
-                    },
-                    {
-                        "contestant": "C",
-                        "judge": "J",
-                        "item": "P",
-                        "score": 7.0,
-                        "decision": None,
-                    },
-                ]
-            )
-        )
-
-    def test_rejects_malformed_entries(self):
-        self.assertFalse(valid_basis_shape("nope"))
-        self.assertFalse(valid_basis_shape([{"contestant": "A"}]))
-        self.assertFalse(
-            valid_basis_shape(
-                [{"contestant": "A", "judge": "J", "item": "P", "score": True}]
-            )
-        )
-        for bad_decision in ({"use_raw": "yes", "reason": "r"}, {"use_raw": True}, "x"):
-            self.assertFalse(
-                valid_basis_shape(
-                    [
-                        {
-                            "contestant": "A",
-                            "judge": "J",
-                            "item": "P",
-                            "score": 1.0,
-                            "decision": bad_decision,
-                        }
-                    ]
-                )
-            )
-
-
-class TestNormalizeIncomingRecords(unittest.TestCase):
-    def test_accepts_valid_records(self):
-        out = normalize_incoming_records([
-            {"contestant": " A ", "judge": "J", "item": "P", "score": "8.5"},
-            {"contestant": "B", "judge": "J", "item": "P", "score": 9},
-        ])
-        self.assertEqual(out[0]["contestant"], "A")
-        self.assertEqual(out[0]["score"], 8.5)
-        self.assertEqual(out[1]["score"], 9.0)
-
-    def test_rejects_bad_shapes(self):
-        with self.assertRaises(MergeValidationError):
-            normalize_incoming_records("nope")
-        with self.assertRaises(MergeValidationError):
-            normalize_incoming_records(["nope"])
-        with self.assertRaises(MergeValidationError):
-            normalize_incoming_records([])
-
-    def test_rejects_missing_fields_and_bad_numbers(self):
-        cases = [
-            [{"judge": "J", "item": "P", "score": 1}],          # missing contestant
-            [{"contestant": "A", "judge": " ", "item": "P", "score": 1}],  # blank judge
-            [{"contestant": "A", "judge": "J", "item": "P", "score": ""}],
-            [{"contestant": "A", "judge": "J", "item": "P", "score": "好"}],
-            [{"contestant": "A", "judge": "J", "item": "P", "score": float("inf")}],
-            [{"contestant": "A", "judge": "J", "item": "P"}],  # score missing
-        ]
-        for payload in cases:
-            with self.assertRaises(MergeValidationError):
-                normalize_incoming_records(payload)
-
-    def test_rejects_boolean_score_and_duplicate_triple(self):
-        with self.assertRaises(MergeValidationError):
-            normalize_incoming_records([{"contestant": "A", "judge": "J", "item": "P", "score": True}])
-        with self.assertRaises(MergeValidationError) as ctx:
-            normalize_incoming_records([
-                {"contestant": "A", "judge": "J", "item": "P", "score": 1},
-                {"contestant": "A", "judge": "J", "item": "P", "score": 2},
-            ])
-        self.assertIn("重复", str(ctx.exception))
 
 
 if __name__ == "__main__":

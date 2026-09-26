@@ -1,4 +1,8 @@
-"""API tests for the merge-import flow (preview read-only, confirm transactional)."""
+"""API tests for the merge-import flow.
+
+预览把「待合并记录 + 预览基线」作为会话专属快照存入服务端并返回一次性
+标识；确认只携带该标识，在同一事务内取回快照、核对基线并原子消耗标识。
+"""
 import os
 import sys
 import tempfile
@@ -36,44 +40,67 @@ MERGED = (
 )
 
 
-def upload(csv_text):
+def upload(csv_text, sid=SID):
     return client.post(
-        f"/api/sessions/{SID}/upload?scope=judge",
+        f"/api/sessions/{sid}/upload?scope=judge",
         files={"file": ("s.csv", csv_text.encode("utf-8-sig"), "text/csv")},
     )
 
 
-def preview(csv_text):
+def preview(csv_text, sid=SID, scope=None):
+    url = f"/api/sessions/{sid}/merge/preview"
+    if scope is not None:
+        url += f"?scope={scope}"
     return client.post(
-        f"/api/sessions/{SID}/merge/preview",
+        url,
         files={"file": ("m.csv", csv_text.encode("utf-8-sig"), "text/csv")},
     )
 
 
-def confirm(payload):
-    return client.post(f"/api/sessions/{SID}/merge/confirm", json=payload)
+def confirm(payload, sid=SID):
+    return client.post(f"/api/sessions/{sid}/merge/confirm", json=payload)
 
 
-def score_map(analysis):
+def confirm_token(token, sid=SID):
+    return confirm({"token": token}, sid=sid)
+
+
+def analysis(sid=SID):
+    return client.get(f"/api/sessions/{sid}/analysis").json()
+
+
+def score_map(data):
     return {
         (b["contestant"], s["judge"], ib["item"]): s
-        for b in analysis["contestants"]
+        for b in data["contestants"]
         for ib in b["items"]
         for s in ib["scores"]
     }
+
+
+def id_map(data):
+    return {
+        (b["contestant"], s["judge"], ib["item"]): s["id"]
+        for b in data["contestants"]
+        for ib in b["items"]
+        for s in ib["scores"]
+    }
+
+
+def put_decision(score_id, use_raw, reason):
+    return client.patch(
+        f"/api/sessions/{SID}/scores/{score_id}/decision",
+        json={"use_raw": use_raw, "reason": reason},
+    )
 
 
 class TestMergeAPI(unittest.TestCase):
     def test_01_preview_readonly_and_classification(self):
         self.assertEqual(upload(INITIAL).status_code, 200)
         # Put a decision on C1/JA/P1 (changed row) and C1/JB/P1 (unchanged row).
-        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
-        id_of = {(b["contestant"], s["judge"], ib["item"]): s["id"]
-                 for b in analysis["contestants"] for ib in b["items"] for s in ib["scores"]}
-        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
-                     json={"use_raw": True, "reason": "人工保留甲"})
-        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JB', 'P1')]}/decision",
-                     json={"use_raw": True, "reason": "校准乙"})
+        ids = id_map(analysis())
+        put_decision(ids[("C1", "JA", "P1")], True, "人工保留甲")
+        put_decision(ids[("C1", "JB", "P1")], True, "校准乙")
 
         r = preview(MERGED)
         self.assertEqual(r.status_code, 200, r.text)
@@ -102,9 +129,11 @@ class TestMergeAPI(unittest.TestCase):
         ad = rows[("C3", "JA", "P1")]
         self.assertEqual(ad["status"], "added")
         self.assertIsNone(ad["old_score"])
-        # Payload needed for confirm is echoed back.
-        self.assertEqual(len(p["records"]), 5)
-        self.assertEqual(len(p["basis"]), 4)
+        # 确认凭一次性标识进行；记录与基线不再回传（由服务端快照保管）。
+        self.assertIsInstance(p["token"], str)
+        self.assertGreaterEqual(len(p["token"]), 32)
+        self.assertNotIn("records", p)
+        self.assertNotIn("basis", p)
         # Bucket order: changed -> added -> removed -> unchanged.
         statuses = [x["status"] for x in p["rows"]]
         self.assertEqual(statuses, sorted(statuses, key={
@@ -112,7 +141,7 @@ class TestMergeAPI(unittest.TestCase):
         }.__getitem__))
 
         # Preview must not touch scores or decisions.
-        again = client.get(f"/api/sessions/{SID}/analysis").json()
+        again = analysis()
         self.assertEqual(again["counts"]["scores"], 4)
         self.assertEqual(again["counts"]["decisions"], 2)
 
@@ -128,38 +157,91 @@ class TestMergeAPI(unittest.TestCase):
         self.assertEqual(preview(dup).status_code, 400)
 
     def test_03_confirm_stale_basis_conflicts(self):
-        p = preview(MERGED).json()
-        stale_basis = p["basis"][:-1]  # simulate data changed since preview
-        r = confirm({"records": p["records"], "basis": stale_basis})
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        token = preview(MERGED).json()["token"]
+        # 预览后当前会话数据被其它操作改动 → 基线不再匹配。
+        self.assertEqual(upload(HEADER + "C1,JA,P1,8.1\n").status_code, 200)
+        r = confirm_token(token)
         self.assertEqual(r.status_code, 409)
         self.assertIn("重新预览", r.json()["detail"])
         # Nothing was applied.
-        self.assertEqual(
-            client.get(f"/api/sessions/{SID}/analysis").json()["counts"]["scores"], 4
-        )
+        self.assertEqual(analysis()["counts"]["scores"], 1)
 
-    def test_04_confirm_validation_errors(self):
-        p = preview(MERGED).json()
-        # Not a list -> pydantic 422.
-        r = confirm({"records": "nope", "basis": p["basis"]})
-        self.assertEqual(r.status_code, 422)
-        # Empty list -> pydantic 422 (min_length=1).
-        r = confirm({"records": [], "basis": p["basis"]})
-        self.assertEqual(r.status_code, 422)
-        # Malformed record -> 400 from normalize.
-        bad = [dict(p["records"][0])]
-        bad[0]["score"] = "不是数字"
-        r = confirm({"records": bad, "basis": p["basis"]})
-        self.assertEqual(r.status_code, 400)
-        self.assertIn("不是数字", r.json()["detail"])
-        # Duplicate triple inside records -> 400.
-        r = confirm({"records": p["records"] + [p["records"][0]], "basis": p["basis"]})
-        self.assertEqual(r.status_code, 400)
-        self.assertIn("重复", r.json()["detail"])
+    def test_04_confirm_token_validation(self):
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        token = preview(MERGED).json()["token"]
+        # Missing/empty token -> pydantic 422.
+        self.assertEqual(confirm({}).status_code, 422)
+        self.assertEqual(confirm({"token": ""}).status_code, 422)
+        # Unknown token -> 404, 提示重新预览。
+        r = confirm_token("伪造的标识")
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("重新预览", r.json()["detail"])
+        # 其它会话的标识不可用（标识是会话专属的）。
+        r = confirm_token(token, sid="other-session")
+        self.assertEqual(r.status_code, 404)
+        # 以上失败都不写数据，也不消耗合法标识。
+        self.assertEqual(analysis()["counts"]["scores"], 4)
+        r = confirm_token(token)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["counts"]["scores"], 5)
 
-    def test_05_confirm_applies_in_transaction(self):
-        p = preview(MERGED).json()
-        r = confirm({"records": p["records"], "basis": p["basis"]})
+    def test_05_confirm_ignores_client_supplied_records(self):
+        """回归：确认请求里篡改的记录/基线被忽略，只应用预览快照。"""
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        token = preview(MERGED).json()["token"]
+        # 攻击场景：预览显示 8.0→8.5，确认时把回传记录改成 99。
+        r = confirm({
+            "token": token,
+            "records": [{"contestant": "C1", "judge": "JA", "item": "P1", "score": 99}],
+            "basis": [],
+            "scope": "judge_item",
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        m = score_map(data)
+        # 写入的是预览时的 8.5 而不是未预览的 99；其余差异也来自预览快照。
+        self.assertEqual(m[("C1", "JA", "P1")]["raw"], 8.5)
+        self.assertEqual(data["counts"]["scores"], 5)
+        self.assertEqual(m[("C2", "JB", "P1")]["raw"], 6.5)
+        self.assertIn(("C3", "JA", "P1"), m)
+        # 会话已存在，校准范围保持原样（忽略请求里的 scope）。
+        self.assertEqual(data["scope"], "judge")
+
+    def test_06_token_is_single_use(self):
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        token = preview(MERGED).json()["token"]
+        r = confirm_token(token)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["counts"]["scores"], 5)
+        # 同一标识再次确认 → 409，且不重复写入。
+        r = confirm_token(token)
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("重新预览", r.json()["detail"])
+        self.assertEqual(analysis()["counts"]["scores"], 5)
+
+    def test_07_new_preview_invalidates_previous_token(self):
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        old_token = preview(MERGED).json()["token"]
+        new_token = preview(MERGED).json()["token"]
+        self.assertNotEqual(old_token, new_token)
+        # 同一会话只保留最新预览：旧标识作废。
+        r = confirm_token(old_token)
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("重新预览", r.json()["detail"])
+        self.assertEqual(analysis()["counts"]["scores"], 4)
+        # 新标识仍可确认。
+        r = confirm_token(new_token)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["counts"]["scores"], 5)
+
+    def test_08_confirm_applies_in_transaction(self):
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        ids = id_map(analysis())
+        put_decision(ids[("C1", "JA", "P1")], True, "人工保留甲")
+        put_decision(ids[("C1", "JB", "P1")], True, "校准乙")
+        token = preview(MERGED).json()["token"]
+        r = confirm_token(token)
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
         applied = data["merge_applied"]
@@ -185,70 +267,61 @@ class TestMergeAPI(unittest.TestCase):
         self.assertEqual(keep["reason"], "校准乙")
         self.assertEqual(keep["raw"], 7.0)
 
-    def test_06_unchanged_rows_keep_ids_and_remerge_is_all_unchanged(self):
+    def test_09_unchanged_rows_keep_ids_and_remerge_is_all_unchanged(self):
         # Re-preview the just-merged state with the same file: nothing to do.
         p = preview(MERGED).json()
         self.assertEqual(p["counts"], {"changed": 0, "added": 0, "removed": 0, "unchanged": 5})
         self.assertEqual(p["will_modify"], 0)
         self.assertEqual(p["decisions_cleared"], 0)
         # Confirming a no-op merge still succeeds and changes nothing.
-        r = confirm({"records": p["records"], "basis": p["basis"]})
+        r = confirm_token(p["token"])
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["counts"]["scores"], 5)
         self.assertEqual(r.json()["counts"]["decisions"], 1)
 
-    def test_07_batch_rules_are_not_touched_by_merge(self):
-        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
-        judge = analysis["judges"][0]
+    def test_10_batch_rules_are_not_touched_by_merge(self):
+        judge = analysis()["judges"][0]
         client.put(f"/api/sessions/{SID}/rules", json={"rules": [
             {"name": "合并后规则保留", "judge": judge, "use_raw": True, "priority": 5},
         ]})
         next_csv = HEADER + "C1,JA,P1,9.9\nC1,JB,P1,7.0\nC2,JB,P1,6.5\nC3,JA,P1,5.0\nC3,JB,P1,4.0\n"
         p = preview(next_csv).json()
         self.assertEqual(p["counts"]["changed"], 1)
-        r = confirm({"records": p["records"], "basis": p["basis"]})
+        r = confirm_token(p["token"])
         self.assertEqual(r.status_code, 200, r.text)
         rules = client.get(f"/api/sessions/{SID}/rules").json()["rules"]
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0]["name"], "合并后规则保留")
         self.assertEqual(rules[0]["judge"], judge)
 
-    def test_08_preview_on_brand_new_session_is_all_added_and_creates_nothing(self):
+    def test_11_preview_on_brand_new_session_is_all_added_and_creates_nothing(self):
         fresh = "brand-new-merge-session"
-        r = client.post(
-            f"/api/sessions/{fresh}/merge/preview?scope=judge_item",
-            files={"file": ("m.csv", MERGED.encode(), "text/csv")},
-        )
-        self.assertEqual(r.status_code, 200, r.text)
-        p = r.json()
+        p = preview(MERGED, sid=fresh, scope="judge_item").json()
         self.assertFalse(p["session_existed"])
         self.assertEqual(p["scope"], "judge_item")
         self.assertEqual(p["counts"]["added"], 5)
         self.assertEqual(p["total_current"], 0)
         # Preview must not create the session.
-        self.assertEqual(
-            client.get(f"/api/sessions/{fresh}/analysis").json()["counts"]["scores"], 0
-        )
-        # Confirm into the empty session creates it with the chosen scope.
-        r = client.post(f"/api/sessions/{fresh}/merge/confirm",
-                        json={"records": p["records"], "basis": [], "scope": "judge_item"})
+        self.assertEqual(analysis(fresh)["counts"]["scores"], 0)
+        # 确认只带标识；会话按预览时选定的校准范围创建。
+        r = confirm_token(p["token"], sid=fresh)
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
         self.assertEqual(data["counts"]["scores"], 5)
         self.assertEqual(data["scope"], "judge_item")
 
-    def test_09_cancel_is_nothing(self):
+    def test_12_cancel_is_nothing(self):
         # Issuing a preview and walking away (no confirm) leaves data intact.
-        before = client.get(f"/api/sessions/{SID}/analysis").json()
+        before = analysis()
         p = preview(HEADER + "C1,JA,P1,1.0\n").json()
         self.assertEqual(p["will_modify"], 5)
-        after = client.get(f"/api/sessions/{SID}/analysis").json()
+        after = analysis()
         self.assertEqual(before["counts"], after["counts"])
         self.assertEqual(score_map(after)[("C1", "JA", "P1")]["raw"], 9.9)
 
-    def test_10_confirm_rolls_back_on_failure(self):
-        before = client.get(f"/api/sessions/{SID}/analysis").json()
-        p = preview(HEADER + "C1,JA,P1,2.2\n").json()
+    def test_13_confirm_rolls_back_on_failure(self):
+        before = analysis()
+        token = preview(HEADER + "C1,JA,P1,2.2\n").json()["token"]
 
         original_merge = db.merge_scores
 
@@ -263,42 +336,36 @@ class TestMergeAPI(unittest.TestCase):
         try:
             r = quiet_client.post(
                 f"/api/sessions/{SID}/merge/confirm",
-                json={"records": p["records"], "basis": p["basis"]},
+                json={"token": token},
             )
         finally:
             db.merge_scores = original_merge
         self.assertEqual(r.status_code, 500)
 
-        after = client.get(f"/api/sessions/{SID}/analysis").json()
+        after = analysis()
         self.assertEqual(after["counts"], before["counts"])
         m = score_map(after)
         self.assertEqual(m[("C1", "JA", "P1")]["raw"], 9.9)  # no phantom -999
         self.assertEqual(len(m), before["counts"]["scores"])  # no added/removed leaked
+        # 事务回滚连同标识消耗一并撤销：同一标识可重试并成功。
+        r = confirm_token(token)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(score_map(r.json())[("C1", "JA", "P1")]["raw"], 2.2)
 
     # --- 预览基线同时核对受影响评分的裁决状态 ---
 
-    def test_11_decision_added_after_preview_conflicts(self):
+    def test_14_decision_added_after_preview_conflicts(self):
         self.assertEqual(upload(INITIAL).status_code, 200)
         # C2/JB/P1 是分数变更行且本无裁决；预览后给它新增裁决。
-        p = preview(MERGED).json()
-        self.assertEqual(p["counts"]["changed"], 2)
-        # 基线中受影响行（变更/删除）带 decision 快照，未变行不带。
-        by_key = {(b["contestant"], b["judge"], b["item"]): b for b in p["basis"]}
-        self.assertIsNone(by_key[("C2", "JB", "P1")]["decision"])
-        self.assertIsNone(by_key[("C2", "JA", "P1")]["decision"])
-        self.assertNotIn("decision", by_key[("C1", "JB", "P1")])
+        token = preview(MERGED).json()["token"]
+        ids = id_map(analysis())
+        put_decision(ids[("C2", "JB", "P1")], True, "预览后新增")
 
-        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
-        id_of = {(b["contestant"], s["judge"], ib["item"]): s["id"]
-                 for b in analysis["contestants"] for ib in b["items"] for s in ib["scores"]}
-        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C2', 'JB', 'P1')]}/decision",
-                     json={"use_raw": True, "reason": "预览后新增"})
-
-        r = confirm({"records": p["records"], "basis": p["basis"]})
+        r = confirm_token(token)
         self.assertEqual(r.status_code, 409)
         self.assertIn("重新预览", r.json()["detail"])
         # 未写入任何合并结果：分数与裁决原样保留。
-        after = client.get(f"/api/sessions/{SID}/analysis").json()
+        after = analysis()
         self.assertEqual(after["counts"]["scores"], 4)
         self.assertEqual(after["counts"]["decisions"], 1)
         m = score_map(after)
@@ -306,58 +373,44 @@ class TestMergeAPI(unittest.TestCase):
         self.assertTrue(m[("C2", "JB", "P1")]["use_raw"])
         self.assertEqual(m[("C2", "JB", "P1")]["reason"], "预览后新增")
 
-    def test_12_decision_modified_or_removed_after_preview_conflicts(self):
+    def test_15_decision_modified_or_removed_after_preview_conflicts(self):
         self.assertEqual(upload(INITIAL).status_code, 200)
-        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
-        id_of = {(b["contestant"], s["judge"], ib["item"]): s["id"]
-                 for b in analysis["contestants"] for ib in b["items"] for s in ib["scores"]}
+        ids = id_map(analysis())
         # C1/JA/P1 是分数变更行，预览前已有裁决。
-        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
-                     json={"use_raw": True, "reason": "原始裁决"})
-        p = preview(MERGED).json()
-        by_key = {(b["contestant"], b["judge"], b["item"]): b for b in p["basis"]}
-        self.assertEqual(
-            by_key[("C1", "JA", "P1")]["decision"],
-            {"use_raw": True, "reason": "原始裁决"},
-        )
+        put_decision(ids[("C1", "JA", "P1")], True, "原始裁决")
+        token = preview(MERGED).json()["token"]
 
         # 预览后修改该裁决 → 409，且裁决保持修改后的样子（未被合并清除）。
-        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
-                     json={"use_raw": False, "reason": "预览后修改"})
-        r = confirm({"records": p["records"], "basis": p["basis"]})
+        put_decision(ids[("C1", "JA", "P1")], False, "预览后修改")
+        r = confirm_token(token)
         self.assertEqual(r.status_code, 409)
-        after = client.get(f"/api/sessions/{SID}/analysis").json()
+        after = analysis()
         self.assertEqual(after["counts"]["scores"], 4)
         m = score_map(after)
         self.assertFalse(m[("C1", "JA", "P1")]["use_raw"])
         self.assertEqual(m[("C1", "JA", "P1")]["reason"], "预览后修改")
 
         # 预览后删除该裁决 → 同样 409。
-        p2 = preview(MERGED).json()
+        token2 = preview(MERGED).json()["token"]
         client.post(f"/api/sessions/{SID}/decisions/reset")
-        r = confirm({"records": p2["records"], "basis": p2["basis"]})
+        r = confirm_token(token2)
         self.assertEqual(r.status_code, 409)
-        after = client.get(f"/api/sessions/{SID}/analysis").json()
+        after = analysis()
         self.assertEqual(after["counts"]["scores"], 4)
         self.assertEqual(after["counts"]["decisions"], 0)
 
-    def test_13_unchanged_row_decision_change_does_not_block(self):
+    def test_16_unchanged_row_decision_change_does_not_block(self):
         self.assertEqual(upload(INITIAL).status_code, 200)
-        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
-        id_of = {(b["contestant"], s["judge"], ib["item"]): s["id"]
-                 for b in analysis["contestants"] for ib in b["items"] for s in ib["scores"]}
+        ids = id_map(analysis())
         # 变更行 C1/JA/P1 与未变行 C1/JB/P1 各置一条裁决。
-        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
-                     json={"use_raw": True, "reason": "将被清除"})
-        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JB', 'P1')]}/decision",
-                     json={"use_raw": True, "reason": "未变行原裁决"})
+        put_decision(ids[("C1", "JA", "P1")], True, "将被清除")
+        put_decision(ids[("C1", "JB", "P1")], True, "未变行原裁决")
         p = preview(MERGED).json()
         self.assertEqual(p["decisions_cleared"], 1)
 
         # 预览后只改未变行的裁决 → 不阻塞合并。
-        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JB', 'P1')]}/decision",
-                     json={"use_raw": False, "reason": "预览后改过的未变行裁决"})
-        r = confirm({"records": p["records"], "basis": p["basis"]})
+        put_decision(ids[("C1", "JB", "P1")], False, "预览后改过的未变行裁决")
+        r = confirm_token(p["token"])
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
         self.assertEqual(data["merge_applied"]["decisions_cleared"], 1)
@@ -369,28 +422,15 @@ class TestMergeAPI(unittest.TestCase):
         self.assertFalse(keep["use_raw"])
         self.assertEqual(keep["reason"], "预览后改过的未变行裁决")
 
-    def test_14_malformed_decision_snapshot_is_400(self):
+    def test_17_cleared_session_forgets_pending_tokens(self):
         self.assertEqual(upload(INITIAL).status_code, 200)
-        p = preview(MERGED).json()
-        # 受影响行的 decision 快照格式非法 → 400（非 409）。
-        bad = [dict(b) for b in p["basis"]]
-        target = next(b for b in bad if "decision" in b)
-        target["decision"] = {"use_raw": "yes", "reason": 1}
-        r = confirm({"records": p["records"], "basis": bad})
-        self.assertEqual(r.status_code, 400)
+        token = preview(MERGED).json()["token"]
+        client.delete(f"/api/sessions/{SID}")
+        # 会话清空后，其待合并标识一并失效。
+        r = confirm_token(token)
+        self.assertEqual(r.status_code, 404)
         self.assertIn("重新预览", r.json()["detail"])
-        # 未受影响行不得携带 decision 字段 → 409 状态不匹配。
-        tampered = [dict(b) for b in p["basis"]]
-        extra = next(
-            b for b in tampered
-            if (b["contestant"], b["judge"], b["item"]) == ("C1", "JB", "P1")
-        )
-        extra["decision"] = None
-        r = confirm({"records": p["records"], "basis": tampered})
-        self.assertEqual(r.status_code, 409)
-        self.assertEqual(
-            client.get(f"/api/sessions/{SID}/analysis").json()["counts"]["scores"], 4
-        )
+        self.assertEqual(analysis()["counts"]["scores"], 0)
 
 
 if __name__ == "__main__":

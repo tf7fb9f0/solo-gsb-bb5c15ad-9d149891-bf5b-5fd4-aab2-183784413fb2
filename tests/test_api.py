@@ -501,7 +501,7 @@ class TestAPI(unittest.TestCase):
 
         confirmed = client.post(
             f"/api/sessions/{SID}/merge/confirm",
-            json={"records": preview["records"], "basis": preview["basis"], "scope": "judge"},
+            json={"token": preview["token"]},
         ).json()
         dg = confirmed["judge_disagreement"]
         g = dg["groups"][0]

@@ -2288,7 +2288,7 @@ function onReasonInput(ev) {
 }
 
 // ---------- Merge import (preview then confirm) ----------
-let mergeData = null; // 最近一次合并预览结果（只读，不落库）
+let mergeData = null; // 最近一次合并预览结果（含一次性确认标识；不写评分/裁决）
 let mergeFilter = "all";
 
 function clearMergePreview() {
@@ -2442,11 +2442,11 @@ async function confirmMerge() {
   ) return;
   setMergeMsg("正在同一事务中应用合并…");
   try {
-    const scope = document.querySelector('input[name="scope"]:checked').value;
+    // 确认只回传预览标识：待合并记录与基线由服务端按标识从事务内快照取回。
     analysis = await api(`/api/sessions/${SESSION_ID}/merge/confirm`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: p.records, basis: p.basis, scope }),
+      body: JSON.stringify({ token: p.token }),
     });
     const applied = analysis.merge_applied.counts;
     const cleared = analysis.merge_applied.decisions_cleared;

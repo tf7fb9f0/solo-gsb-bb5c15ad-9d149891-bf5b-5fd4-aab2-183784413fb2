@@ -1,6 +1,7 @@
 """SQLite persistence. The database file lives under DATA_DIR (container volume)."""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -53,6 +54,16 @@ CREATE TABLE IF NOT EXISTS batch_rules (
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_batch_rules_session ON batch_rules(session_id, position);
+CREATE TABLE IF NOT EXISTS merge_previews (
+    token TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'judge',
+    records TEXT NOT NULL,
+    basis TEXT NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_merge_previews_session ON merge_previews(session_id);
 """
 
 
@@ -70,6 +81,9 @@ def get_conn() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 并发确认同一合并标识时，第二个写事务等待而非立即报 SQLITE_BUSY，
+    # 随后在原子消耗（UPDATE … WHERE consumed = 0）上得到 rowcount 0。
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -203,6 +217,81 @@ def merge_scores(
     return {"counts": counts, "decisions_cleared": decisions_cleared}
 
 
+# ---------- Merge preview snapshots (preview/confirm binding) ----------
+
+
+def save_merge_preview(
+    conn: sqlite3.Connection,
+    session_id: str,
+    token: str,
+    records: Sequence[Mapping[str, Any]],
+    basis: Sequence[Mapping[str, Any]],
+    scope: str,
+) -> None:
+    """保存会话专属的待合并快照（预览时不写评分/裁决，也不创建会话）。
+
+    快照含预览时刻解析出的待合并记录、预览基线与校准范围，确认时仅凭
+    不可猜测的 ``token`` 取回——确认请求不携带任何记录，客户端无法注入
+    未预览的数据。同一会话只保留最新一次预览：旧快照（含已消耗的）随
+    新预览一并作废。
+    """
+    conn.execute("DELETE FROM merge_previews WHERE session_id = ?", (session_id,))
+    conn.execute(
+        "INSERT INTO merge_previews(token, session_id, scope, records, basis) "
+        "VALUES(?, ?, ?, ?, ?)",
+        (
+            token,
+            session_id,
+            scope,
+            json.dumps(list(records), ensure_ascii=False),
+            json.dumps(list(basis), ensure_ascii=False),
+        ),
+    )
+
+
+def claim_merge_preview(
+    conn: sqlite3.Connection, session_id: str, token: str
+) -> dict[str, Any] | None:
+    """在调用方的事务内原子消耗并取回待合并快照。
+
+    返回 ``None`` 表示标识无效（不存在、不属于该会话或已被更新的预览
+    作废）；返回 ``{"already_used": True}`` 表示标识已被消耗（一次性，
+    防止重复确认）；成功时返回 ``{"records", "basis", "scope"}`` 并把
+    标识标记为已消耗。``UPDATE … WHERE consumed = 0`` 使消耗是原子的：
+    并发确认同一标识时只有一个事务得到 rowcount 1。若后续基线核对或
+    合并写入失败，调用方事务整体回滚，消耗一并撤销。
+    """
+    cur = conn.execute(
+        "UPDATE merge_previews SET consumed = 1 "
+        "WHERE token = ? AND session_id = ? AND consumed = 0",
+        (token, session_id),
+    )
+    if cur.rowcount == 1:
+        row = conn.execute(
+            "SELECT scope, records, basis FROM merge_previews WHERE token = ?",
+            (token,),
+        ).fetchone()
+        return {
+            "scope": row["scope"],
+            "records": json.loads(row["records"]),
+            "basis": json.loads(row["basis"]),
+        }
+    row = conn.execute(
+        "SELECT consumed FROM merge_previews WHERE token = ? AND session_id = ?",
+        (token, session_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"already_used": True}
+
+
+def delete_merge_previews(conn: sqlite3.Connection, session_id: str) -> int:
+    cur = conn.execute(
+        "DELETE FROM merge_previews WHERE session_id = ?", (session_id,)
+    )
+    return cur.rowcount
+
+
 def load_scores(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT id, contestant, judge, item, score FROM scores "
@@ -243,6 +332,8 @@ def reset_decisions(conn: sqlite3.Connection, session_id: str) -> int:
 
 
 def delete_session(conn: sqlite3.Connection, session_id: str) -> bool:
+    # merge_previews 无外键（预览不创建会话），需随会话显式清理。
+    conn.execute("DELETE FROM merge_previews WHERE session_id = ?", (session_id,))
     cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
     return cur.rowcount > 0
 
